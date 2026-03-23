@@ -168,24 +168,7 @@ def _cached_records(name="sheet1") -> list:
             return data
     for attempt in range(2):
         try:
-            sh = _get_worksheet(name)
-            # Читаем сырые значения чтобы избежать ошибки дублирующихся заголовков
-            all_values = sh.get_all_values()
-            if not all_values:
-                _records_cache[name] = (now, [])
-                return []
-            headers = all_values[0]
-            # Делаем заголовки уникальными если есть дубли
-            seen = {}
-            unique_headers = []
-            for h in headers:
-                if h in seen:
-                    seen[h] += 1
-                    unique_headers.append(f"{h}_{seen[h]}")
-                else:
-                    seen[h] = 0
-                    unique_headers.append(h)
-            data = [dict(zip(unique_headers, row)) for row in all_values[1:] if any(row)]
+            data = _get_worksheet(name).get_all_records()
             _records_cache[name] = (now, data)
             return data
         except Exception:
