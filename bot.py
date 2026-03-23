@@ -22,7 +22,10 @@ GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 CHAT_ID          = os.getenv("CHAT_ID")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
@@ -108,10 +111,22 @@ def _get_gs_client():
     global _gs_client
     if _gs_client is None:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = (Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS), scopes=scopes)
-                 if GOOGLE_CREDENTIALS else
-                 Credentials.from_service_account_file("credentials.json", scopes=scopes))
-        _gs_client = gspread.authorize(creds)
+        try:
+            if GOOGLE_CREDENTIALS:
+                # Убираем возможные лишние пробелы/переносы вокруг JSON
+                raw = GOOGLE_CREDENTIALS.strip()
+                creds_dict = json.loads(raw)
+                creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+            else:
+                creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+            _gs_client = gspread.authorize(creds)
+            logger.info("Google Sheets: подключено успешно")
+        except json.JSONDecodeError as e:
+            logger.error(f"GOOGLE_CREDENTIALS невалидный JSON", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Google Sheets авторизация", exc_info=True)
+            raise
     return _gs_client
 
 def _get_spreadsheet():
@@ -120,9 +135,23 @@ def _get_spreadsheet():
         _spreadsheet = _get_gs_client().open_by_key(GOOGLE_SHEET_ID)
     return _spreadsheet
 
+def _reset_connection():
+    """Сбрасывает соединение при ошибке"""
+    global _gs_client, _spreadsheet
+    _gs_client = None
+    _spreadsheet = None
+    _records_cache.clear()
+
 def _get_worksheet(name="sheet1"):
-    sp = _get_spreadsheet()
-    return sp.sheet1 if name == "sheet1" else (sp.worksheet(name) if _worksheet_exists(sp, name) else sp.add_worksheet(title=name, rows=100, cols=6))
+    try:
+        sp = _get_spreadsheet()
+        if name == "sheet1":
+            return sp.sheet1
+        return sp.worksheet(name) if _worksheet_exists(sp, name) else sp.add_worksheet(title=name, rows=200, cols=10)
+    except Exception as e:
+        logger.error(f"_get_worksheet({name})", exc_info=True)
+        _reset_connection()
+        raise
 
 def _worksheet_exists(sp, name):
     try: sp.worksheet(name); return True
@@ -137,13 +166,33 @@ def _cached_records(name="sheet1") -> list:
         ts, data = _records_cache[name]
         if now - ts < CACHE_TTL:
             return data
-    try:
-        data = _get_worksheet(name).get_all_records()
-        _records_cache[name] = (now, data)
-        return data
-    except Exception as e:
-        logger.error(f"Cache read error ({name}): {e}")
-        return []
+    for attempt in range(2):
+        try:
+            sh = _get_worksheet(name)
+            # Читаем сырые значения чтобы избежать ошибки дублирующихся заголовков
+            all_values = sh.get_all_values()
+            if not all_values:
+                _records_cache[name] = (now, [])
+                return []
+            headers = all_values[0]
+            # Делаем заголовки уникальными если есть дубли
+            seen = {}
+            unique_headers = []
+            for h in headers:
+                if h in seen:
+                    seen[h] += 1
+                    unique_headers.append(f"{h}_{seen[h]}")
+                else:
+                    seen[h] = 0
+                    unique_headers.append(h)
+            data = [dict(zip(unique_headers, row)) for row in all_values[1:] if any(row)]
+            _records_cache[name] = (now, data)
+            return data
+        except Exception:
+            logger.error(f"Cache read ({name}) попытка {attempt+1}", exc_info=True)
+            if attempt == 0:
+                _reset_connection()
+    return []
 
 # ── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
 _settings: dict = {}
@@ -161,7 +210,7 @@ def load_settings():
         _settings.update(data)
         logger.info(f"Настройки загружены: {list(data.keys())}")
     except Exception as e:
-        logger.error(f"load_settings: {e}")
+        logger.error(f"load_settings", exc_info=True)
 
 def save_setting(key: str, value: str):
     _settings[key] = value
@@ -172,7 +221,7 @@ def save_setting(key: str, value: str):
                 sh.update_cell(i, 2, value); return
         sh.append_row([key, value])
     except Exception as e:
-        logger.error(f"save_setting: {e}")
+        logger.error(f"save_setting", exc_info=True)
 
 def get_setting(key: str, default=None):
     return _settings.get(key, default)
@@ -403,12 +452,12 @@ def load_debts():
             try: debt_counter[0] = max(debt_counter[0], int(r["ID"]))
             except: pass
     except Exception as e:
-        logger.error(f"load_debts: {e}")
+        logger.error(f"load_debts", exc_info=True)
 
 def save_debt(did, name, amounts, date, note=""):
     amt_str = amounts_str(amounts)
     try: _debts_sheet().append_row([did, name, amt_str, date, "активен", note])
-    except Exception as e: logger.error(f"save_debt: {e}")
+    except Exception as e: logger.error(f"save_debt", exc_info=True)
 
 def mark_paid(did):
     try:
@@ -416,7 +465,7 @@ def mark_paid(did):
         for i, r in enumerate(sh.get_all_records(), start=2):
             if str(r.get("ID")) == str(did):
                 sh.update_cell(i, 5, "погашен"); return
-    except Exception as e: logger.error(f"mark_paid: {e}")
+    except Exception as e: logger.error(f"mark_paid", exc_info=True)
 
 def update_debt_amounts(did, new_amounts):
     try:
@@ -424,7 +473,7 @@ def update_debt_amounts(did, new_amounts):
         for i, r in enumerate(sh.get_all_records(), start=2):
             if str(r.get("ID")) == str(did):
                 sh.update_cell(i, 3, amounts_str(new_amounts)); return
-    except Exception as e: logger.error(f"update_debt_amounts: {e}")
+    except Exception as e: logger.error(f"update_debt_amounts", exc_info=True)
 
 def amounts_str(amounts: list) -> str:
     return " + ".join(f"{a['amount']} {CURRENCY_SYMBOLS.get(a.get('currency','UAH'),'₴')}" for a in amounts)
@@ -805,7 +854,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📝 Распознал: _{text}_", parse_mode="Markdown")
         await process(update, context, text)
     except Exception as e:
-        logger.error(f"voice: {e}")
+        logger.error(f"voice", exc_info=True)
         await update.message.reply_text("❌ Не удалось распознать. Попробуй ещё раз.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1159,7 +1208,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str)
                     debts[did]["amounts"] = ex_ams; update_debt_amounts(did, ex_ams)
                     lines.append(f"\n📊 Остаток: {format_amounts(ex_ams)}")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown"); return
-        except Exception as e: logger.error(f"debt_return: {e}")
+        except Exception as e: logger.error(f"debt_return", exc_info=True)
 
     # Добавление к долгу
     if any(kw in lower for kw in ["ещё","еще","плюс","добав","доплат"]):
@@ -1181,7 +1230,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str)
                     await update.message.reply_text(
                         f"➕ Добавлено к *{debts[did]['name']}*\n💰 Итого: {format_amounts(ex_ams)}",
                         parse_mode="Markdown"); return
-        except Exception as e: logger.error(f"debt_add: {e}")
+        except Exception as e: logger.error(f"debt_add", exc_info=True)
 
     # Новый долг
     if any(kw in lower for kw in ["дал в долг","одолжил","дала в долг","долг"]):
@@ -1203,7 +1252,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str)
                 await update.message.reply_text(
                     f"💸 *Долг записан!*\n\n👤 *{parsed['name']}*\n💰 {format_amounts(ams)}{note}\n\n⏰ Напомню через {reminder_label(chat_id)}.",
                     parse_mode="Markdown"); return
-        except Exception as e: logger.error(f"debt_new: {e}")
+        except Exception as e: logger.error(f"debt_new", exc_info=True)
 
     # Быстрый режим (просто число)
     stripped = text.strip().replace(",",".").replace(" ","")
@@ -1258,7 +1307,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str)
             elif pct >= 70: lines.append(f"\n🟡 Бюджет использован на {pct}%")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"process expenses: {e}")
+        logger.error(f"process expenses", exc_info=True)
         await update.message.reply_text("❌ Ошибка при сохранении. Попробуй ещё раз.")
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
